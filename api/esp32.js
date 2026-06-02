@@ -21,7 +21,7 @@ async function sendTokenToESP32(encryptedToken) {
         return reject(new Error(`Impossible d'ouvrir ${PORT_PATH} : ${err.message}`));
       }
 
-      const message = `TOKEN:${encryptedToken}\n`;
+      const message = `PWD:${password}\n`;
 
       // Attendre que l'ESP32 soit prêt (boot ~2s)
       setTimeout(() => {
