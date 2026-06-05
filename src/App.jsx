@@ -141,7 +141,6 @@ export default function App() {
 
       <footer className="footer">
         <span className="footer-logo">Projet Ruben</span>
-        <span>Infrastructure locale · Docker Swarm</span>
         <span>© 2025</span>
       </footer>
     </div>

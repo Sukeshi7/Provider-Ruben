@@ -136,7 +136,6 @@ export default function MachinesView() {
         </div>
         <div className="mv-cluster-info">
           <span className="cluster-dot" />
-          <span>3 machines · Docker Swarm</span>
         </div>
       </div>
 
