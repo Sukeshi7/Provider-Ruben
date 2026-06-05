@@ -1,6 +1,8 @@
 require("dotenv").config();
-const express = require("express");
-const cors    = require("cors");
+const express    = require("express");
+const cors       = require("cors");
+const { exec }   = require("child_process");
+const path       = require("path");
 const { generatePassword, encrypt, decrypt } = require("./aes");
 const { sendTokenToESP32, listPorts }        = require("./esp32");
 
@@ -10,9 +12,6 @@ const PORT = process.env.API_PORT || 3001;
 app.use(cors({ origin: "http://localhost:5173" }));
 app.use(express.json());
 
-// ── POST /api/deploy ──────────────────────────────────────────────
-// Reçoit : { service, config, node }
-// Retourne : { success, message, token (chiffré) }
 app.post("/api/deploy", async (req, res) => {
   const { service, config, node } = req.body;
 
@@ -21,30 +20,52 @@ app.post("/api/deploy", async (req, res) => {
   }
 
   try {
-    // 1 — Générer un mot de passe SSH fort
     const password = generatePassword(16);
-    console.log(`[deploy] Mot de passe généré pour ${node.label}`);
+    console.log(`[deploy] Mot de passe SSH généré pour ${node.label}`);
 
-    // 2 — Chiffrer le mot de passe avec AES-256-GCM
-    const token = encrypt(password);
-    console.log(`[deploy] Token chiffré : ${token.substring(0, 30)}...`);
+    try {
+      await sendTokenToESP32(password);
+      console.log(`[deploy] Mot de passe envoyé sur ${process.env.ESP32_PORT}`);
+    } catch (esp32Err) {
+      console.warn(`[deploy] ESP32 non disponible : ${esp32Err.message}`);
+    }
 
-    // 3 — Envoyer le token chiffré vers l'ESP32 via USB
-    const esp32Result = await sendTokenToESP32(token);
-    console.log(`[deploy] Token envoyé sur ${esp32Result.port}`);
+    const stackFile = path.resolve(__dirname, `../stacks/${service.id}.yml`);
+    const stackName = service.id;
 
-    // 4 — Ici : brancher Docker Swarm / docker stack deploy
-    // exec(`docker stack deploy -c stacks/${service.id}.yml ${service.id}`)
-    console.log(`[deploy] Service ${service.id} → ${node.hostname}`);
+    // Le mot de passe SSH est pour le VPS uniquement
+    // Les autres services (wordpress, multisite) ont leurs propres mots de passe fixes dans le yml
+    const env = Object.assign({}, process.env, {
+      CPU_LIMIT: String(config.cpu),
+      RAM_LIMIT: `${config.ram * 1024}M`,
+      VPS_ROOT_PASSWORD: password,   // uniquement pour le VPS Debian
+    });
 
-    res.json({
-      success:  true,
-      message:  `${service.label} déployé sur ${node.label}. Mot de passe envoyé sur l'ESP32.`,
-      node:     node.label,
-      hostname: node.hostname,
-      service:  service.id,
-      // On ne renvoie PAS le mot de passe en clair au front — sécurité
-      tokenSent: true,
+    const deployCmd = `docker stack deploy -c "${stackFile}" ${stackName} --with-registry-auth`;
+
+    console.log(`[deploy] Lancement : ${stackName} → ${node.hostname}`);
+
+    exec(deployCmd, { env }, (err, stdout, stderr) => {
+      if (err) {
+        console.error(`[deploy] Erreur docker : ${stderr}`);
+        return res.status(500).json({
+          error: `Erreur Docker Swarm : ${stderr || err.message}`,
+          password,
+          tokenSent: false,
+        });
+      }
+
+      console.log(`[deploy] Stack déployée :\n${stdout}`);
+      res.json({
+        success:   true,
+        message:   `${service.label} déployé sur ${node.label}.`,
+        node:      node.label,
+        hostname:  node.hostname,
+        service:   service.id,
+        password,
+        tokenSent: true,
+        dockerOutput: stdout,
+      });
     });
 
   } catch (err) {
@@ -53,8 +74,33 @@ app.post("/api/deploy", async (req, res) => {
   }
 });
 
-// ── GET /api/ports ────────────────────────────────────────────────
-// Liste les ports USB disponibles (debug)
+app.get("/api/status/:stack", (req, res) => {
+  const { stack } = req.params;
+  exec(`docker stack ps ${stack} --format json`, (err, stdout) => {
+    if (err) return res.json({ running: false, services: [] });
+    try {
+      const lines    = stdout.trim().split("\n").filter(Boolean);
+      const services = lines.map((l) => JSON.parse(l));
+      res.json({ running: true, services });
+    } catch {
+      res.json({ running: true, raw: stdout });
+    }
+  });
+});
+
+app.get("/api/nodes", (req, res) => {
+  exec("docker node ls --format json", (err, stdout) => {
+    if (err) return res.status(500).json({ error: "Docker Swarm non initialisé", detail: err.message });
+    try {
+      const lines = stdout.trim().split("\n").filter(Boolean);
+      const nodes = lines.map((l) => JSON.parse(l));
+      res.json({ nodes });
+    } catch {
+      res.json({ raw: stdout });
+    }
+  });
+});
+
 app.get("/api/ports", async (req, res) => {
   try {
     const ports = await listPorts();
@@ -64,23 +110,18 @@ app.get("/api/ports", async (req, res) => {
   }
 });
 
-// ── GET /api/test-crypto ──────────────────────────────────────────
-// Teste le chiffrement sans ESP32
 app.get("/api/test-crypto", (req, res) => {
   const password  = generatePassword(16);
   const token     = encrypt(password);
   const decrypted = decrypt(token);
-  res.json({
-    original:  password,
-    encrypted: token,
-    decrypted,
-    match: password === decrypted,
-  });
+  res.json({ original: password, encrypted: token, decrypted, match: password === decrypted });
 });
 
 app.listen(PORT, () => {
   console.log(`\n API ProjetRuben démarrée sur http://localhost:${PORT}`);
-  console.log(` POST /api/deploy      — déployer un service`);
-  console.log(` GET  /api/ports       — lister les ports USB`);
-  console.log(` GET  /api/test-crypto — tester le chiffrement\n`);
+  console.log(` POST /api/deploy         — déployer un service`);
+  console.log(` GET  /api/status/:stack  — état d'un stack`);
+  console.log(` GET  /api/nodes          — nodes Docker Swarm`);
+  console.log(` GET  /api/ports          — lister les ports USB`);
+  console.log(` GET  /api/test-crypto    — tester le chiffrement\n`);
 });
